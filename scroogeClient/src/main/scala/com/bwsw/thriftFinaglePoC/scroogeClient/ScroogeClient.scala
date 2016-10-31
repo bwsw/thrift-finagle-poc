@@ -3,23 +3,25 @@ package com.bwsw.thriftFinaglePoC.scroogeClient
 import com.bwsw.thriftFinaglePoC.service.SampleService
 import com.bwsw.thriftFinaglePoC.service.SampleService.Add
 import com.bwsw.thriftFinaglePoC.service.ServiceException
+import com.bwsw.thriftFinaglePoC.struct.SampleStruct
 import com.twitter.conversions.time._
-import com.twitter.finagle.service.{TimeoutFilter, RetryExceptionsFilter, Backoff}
+import com.twitter.finagle.service.{Backoff, RetryExceptionsFilter, TimeoutFilter}
 import com.twitter.finagle.thrift.ThriftServiceIface
 import com.twitter.finagle.util.HashedWheelTimer
-import com.twitter.finagle.{Service, Filter, Thrift, IndividualRequestTimeoutException}
-import com.twitter.util.{Future, Await, Monitor, Throw}
+import com.twitter.finagle._
+import com.twitter.util.{Await, Future, Monitor, Throw}
+
+import scala.collection.mutable.ArrayBuffer
 
 object ScroogeClient extends App {
 
-  if (args.length < 3) {
+  if (args.length < 5) {
     println("Usage: \"project scroogeClient\" \"run <T> <Rmin> <Rmax> <N> <M>\"")
     println("Where T is timeout in mills, Rmin/Rmax is min/max latency mills between retries (increases exponentially by a factor of two)")
     println("N is number of total requests to send to server and M is number of responses to wait for ignoring the rests; M <= N")
     System.exit(1)
   }
 
-  //TODO finish N and M story
   val (t, rmin, rmax, n, m) = (args(0).toInt, args(1).toInt, args(2).toInt, args(3).toInt, args(4).toInt)
 
   val clientServiceIface = Thrift.client
@@ -62,5 +64,23 @@ object ScroogeClient extends App {
   val retryClient = Thrift.client.newMethodIface(retryServiceIface)
 
   println(s"2 + 2 is ${Await.result(retryClient.add(2, 2))}")
+
+  val raceClient = Thrift.client.newMethodIface(clientServiceIface)
+  val completedSoFar: ArrayBuffer[SampleStruct] = ArrayBuffer()
+  var done = false
+
+  for (i <- 1 to n) yield raceClient.createStruct(i, s"Struct #$i") onSuccess { struct =>
+    if (completedSoFar.size != m)
+      completedSoFar += struct
+    else
+      done = true
+  }
+
+  while (!done) {
+    Thread.sleep(100)
+  }
+
+  println(s"Got first $m structs:")
+  println(completedSoFar.map(_.toString).mkString("\n"))
 
 }

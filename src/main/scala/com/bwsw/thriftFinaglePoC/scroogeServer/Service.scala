@@ -20,6 +20,15 @@ class Service extends SampleService[Future] {
 
   override def inc(nums: Seq[Int], inc: Int) = Future.value(nums.map(_ + inc))
 
-  override def createStruct(key: Int, value: String) = Future.value(SampleStruct(key, value))
+  override def createStruct(key: Int, value: String) = {
+    key % 5 match {
+      case 0 => Thread.sleep(key * 50000)
+      case 1 => Thread.sleep(key * 40000)
+      case 2 => Thread.sleep(key * 30000)
+      case 3 => Thread.sleep(key * 20000)
+      case 4 => Thread.sleep(key * 10000)
+    }
+    Future.value(SampleStruct(key, value))
+  }
 
 }
