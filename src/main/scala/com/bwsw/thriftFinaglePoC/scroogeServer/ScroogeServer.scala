@@ -12,6 +12,7 @@ object ScroogeServer extends App {
   val conf = ConfigFactory.load()
   val ports = conf.getStringList("server-ports").asScala
 
+  //Instantiate N servers where N is number of ports in configuration file
   val services = ports.zipWithIndex.map { case (port, index) =>
     Thrift.server.serveIface(s":$port", new Service() {
       override def createStruct(key: Int, value: String): Future[SampleStruct] = {
