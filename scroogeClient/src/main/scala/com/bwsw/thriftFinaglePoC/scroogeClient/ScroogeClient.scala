@@ -1,5 +1,7 @@
 package com.bwsw.thriftFinaglePoC.scroogeClient
 
+import collection.JavaConverters._
+import collection.mutable
 import com.bwsw.thriftFinaglePoC.service.SampleService
 import com.bwsw.thriftFinaglePoC.service.SampleService.Add
 import com.bwsw.thriftFinaglePoC.service.ServiceException
@@ -9,43 +11,50 @@ import com.twitter.finagle.service.{Backoff, RetryExceptionsFilter, TimeoutFilte
 import com.twitter.finagle.thrift.ThriftServiceIface
 import com.twitter.finagle.util.HashedWheelTimer
 import com.twitter.finagle._
-import com.twitter.util.{Await, Future, Monitor, Throw}
+import com.twitter.util._
+import com.typesafe.config.ConfigFactory
 
-import scala.collection.mutable.ArrayBuffer
+import scala.util.Random
 
 object ScroogeClient extends App {
 
-  if (args.length < 5) {
-    println("Usage: \"project scroogeClient\" \"run <T> <Rmin> <Rmax> <N> <M>\"")
+  if (args.length < 4) {
+    println("Usage: \"project scroogeClient\" \"run <T> <Rmin> <Rmax> <M>\"")
     println("Where T is timeout in mills, Rmin/Rmax is min/max latency mills between retries (increases exponentially by a factor of two)")
-    println("N is number of total requests to send to server and M is number of responses to wait for ignoring the rests; M <= N")
+    println("M is number of responses to wait for ignoring the rests; M <= N. N is the number of instantiated servers which are taken from configuration file")
     System.exit(1)
   }
 
-  val (t, rmin, rmax, n, m) = (args(0).toInt, args(1).toInt, args(2).toInt, args(3).toInt, args(4).toInt)
+  val conf = ConfigFactory.load()
+  val ports = conf.getStringList("server-ports").asScala
 
-  val clientServiceIface = Thrift.client
-    /*
+  val (t, rmin, rmax, m) = (args(0).toInt, args(1).toInt, args(2).toInt, args(3).toInt)
+
+  /*
     We don't need to log mess from some exceptions (Timeout in this example).
     See http://twitter.github.io/finagle/guide/Clients.html#observability
     */
-    .withMonitor(new Monitor {
-      def handle(t: Throwable): Boolean = true
-    })
-    .newServiceIface[SampleService.ServiceIface](":9099", "foo")
+  val ignoreMonitor = new Monitor {
+    def handle(t: Throwable): Boolean = true
+  }
 
-  val timeoutFilter = new TimeoutFilter[SampleService.Add.Args, SampleService.Add.Result](t.milliseconds, HashedWheelTimer.Default)
+  val clientServiceIfaces = for (port <- ports)
+    yield Thrift.client
+      .withMonitor(ignoreMonitor)
+      .newServiceIface[SampleService.ServiceIface](s":$port", s"foo#$port")
 
-  val retryFilter: RetryExceptionsFilter[SampleService.Add.Args, SampleService.Add.SuccessType] = RetryExceptionsFilter(
-    Backoff.exponential(rmin.milliseconds, 2, rmax.milliseconds)
-  ) {
+  val backoff = Backoff.exponential(rmin.milliseconds, 2, rmax.milliseconds)
+
+  val addTimeoutFilter = new TimeoutFilter[SampleService.Add.Args, SampleService.Add.Result](t.milliseconds, HashedWheelTimer.Default)
+
+  val addRetryFilter: RetryExceptionsFilter[SampleService.Add.Args, SampleService.Add.SuccessType] = RetryExceptionsFilter(backoff) {
     //Default timeout exception
     case Throw(_: IndividualRequestTimeoutException) => println("Failed timeout. Trying again"); true
     //My custom thrift exception (It is not com.twitter.finagle.ServiceException!)
     case Throw(_: ServiceException) => println("They didn't sum my numbers this time. Trying again"); true
   } (HashedWheelTimer.Default)
 
-  val retryServiceIface = clientServiceIface.copy(
+  val addServiceIface = clientServiceIfaces.head.copy(
     //Filters are applied from right to left.
     add = new Filter[Add.Args, Add.Result, Add.Args, Add.SuccessType] {
       /*
@@ -56,31 +65,53 @@ object ScroogeClient extends App {
         service(request).map(x => Add.Result(Some(x)))
       }
     } andThen
-      retryFilter andThen
+      addRetryFilter andThen
       ThriftServiceIface.resultFilter(Add) andThen
-      clientServiceIface.add
+      addTimeoutFilter andThen
+      clientServiceIfaces.head.add
   )
 
-  val retryClient = Thrift.client.newMethodIface(retryServiceIface)
+  val addClient = Thrift.client.newMethodIface(addServiceIface)
 
-  println(s"2 + 2 is ${Await.result(retryClient.add(2, 2))}")
+  println(s"2 + 2 is ${Await.result(addClient.add(2, 2))}")
 
-  val raceClient = Thrift.client.newMethodIface(clientServiceIface)
-  val completedSoFar: ArrayBuffer[SampleStruct] = ArrayBuffer()
+
+  val raceClients = clientServiceIfaces.map(Thrift.client.newMethodIface(_))
+
+  var totalSends = 0
+  val completedSoFar: mutable.Map[SampleStruct, SampleService[Future]] = mutable.Map()
   var done = false
 
-  for (i <- 1 to n) yield raceClient.createStruct(i, s"Struct #$i") onSuccess { struct =>
-    if (completedSoFar.size != m)
-      completedSoFar += struct
-    else
-      done = true
+  def send(messages: Seq[(SampleService[Future], (Int, String))]) =
+    for ((raceClient, (key, value)) <- messages) yield {
+      raceClient.createStruct(key, value) onSuccess { struct =>
+        if (completedSoFar.size < m) {
+          completedSoFar += ((struct, raceClient))
+          if (completedSoFar.size >= m)
+            done = true
+        }
+      }
+      totalSends += 1
+    }
+
+  val timer = HashedWheelTimer.Default
+  timer.schedule(t.milliseconds) {
+    send(raceClients
+      .filterNot(raceClient => completedSoFar.values.exists(_ == raceClient))
+      .map { raceClient =>
+        val key = Random.nextInt(500)
+        (raceClient, (key, s"struct#$key"))
+      })
   }
 
   while (!done) {
     Thread.sleep(100)
   }
 
+  timer.stop()
+
   println(s"Got first $m structs:")
-  println(completedSoFar.map(_.toString).mkString("\n"))
+  println(completedSoFar.keys.map(_.toString).mkString("\n"))
+  println(s"Total sends: $totalSends")
 
 }
