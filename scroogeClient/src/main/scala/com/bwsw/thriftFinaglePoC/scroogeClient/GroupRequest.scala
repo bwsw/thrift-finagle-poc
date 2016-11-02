@@ -20,13 +20,13 @@ import scala.util.Random
 class GroupRequest(serviceIfaces: Seq[SampleService.ServiceIface], m: Int, timeout: Duration) {
 
   val clients = serviceIfaces.map(Thrift.client.newMethodIface(_))
-  val completedSoFar: mutable.Map[SampleStruct, SampleService[Future]] = mutable.Map()
+  val completedSoFar: mutable.Map[SampleService[Future], SampleStruct] = mutable.Map()
   var done = false
 
   private def resend(messages: Seq[(SampleService[Future], (Int, String))]) =
     for ((raceClient, (key, value)) <- messages) yield raceClient.createStruct(key, value) onSuccess { struct =>
       if (completedSoFar.size < m) {
-        completedSoFar += ((struct, raceClient))
+        completedSoFar += ((raceClient, struct))
         if (completedSoFar.size >= m)
           done = true
       }
@@ -41,7 +41,7 @@ class GroupRequest(serviceIfaces: Seq[SampleService.ServiceIface], m: Int, timeo
     val timer = HashedWheelTimer.Default
     timer.schedule(timeout) {
       resend(clients
-        .filterNot(client => completedSoFar.values.exists(_ == client))
+        .filterNot(client => completedSoFar.keys.exists(_ == client))
         .map { client =>
           val key = Random.nextInt(500)
           (client, (key, s"struct#$key"))
@@ -53,7 +53,7 @@ class GroupRequest(serviceIfaces: Seq[SampleService.ServiceIface], m: Int, timeo
 
     timer.stop()
 
-    completedSoFar.keys.take(m).toSeq
+    completedSoFar.values.take(m).toSeq
   }
 
 }
